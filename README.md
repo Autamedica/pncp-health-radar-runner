@@ -4,7 +4,8 @@ Runner público **solo de código** (sin datos, Excel ni credenciales en el repo
 
 Qué consulta en cada corrida:
 - **PNCP Brasil** (`pncp.gov.br/api/search` y `/api/consulta/v1/...`): detecta procesos abiertos de telessaúde, telemedicina, teleconsulta, prontuario electrónico y software de salud; refresca montos, cierres y estados (`Suspensa`, `Encerrada`) sin pisar dictámenes manuales.
-- **TCE-RS Dados Abertos** (`dados.tce.rs.gov.br`) y **Boletín Oficial de Argentina (3.ª Sección)**.
+- **TCE-RS LicitaCon 2026** (`dados.tce.rs.gov.br/dados/licitacon/licitacao/ano/2026.csv.zip`): extrae por HTTP `Range` únicamente `licitacao.csv` (~24 MB en lugar de 282 MB), filtrando licitaciones y credenciamentos activos/recientes de salud digital en Rio Grande do Sul hacia la pestaña `TCE_RS_2026`.
+- **TCE-RS CKAN** (`dados.tce.rs.gov.br`) y **Boletín Oficial de Argentina (3.ª Sección)**.
 
 ---
 
@@ -26,4 +27,4 @@ Andá a este repositorio → **`Settings → Secrets and variables → Actions �
 - `GOOGLE_SHEET_ID`: el ID copiado en el Paso 1.
 - *(Opcional — alertas en vivo)*: `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID`.
 
-A partir de ese momento, cada corrida automática cada 2 horas (o manual desde la pestaña **Actions**) actualiza en vivo las pestañas `Oportunidades_PNCP_BR`, `Resumen_Ejecutivo` y `Log_Sincronizacion` de tu Google Sheet privado.
+A partir de ese momento, cada corrida automática cada 2 horas (o manual desde la pestaña **Actions**) actualiza en vivo las pestañas `Oportunidades_PNCP_BR`, `TCE_RS_2026`, `Resumen_Ejecutivo` y `Log_Sincronizacion` de tu Google Sheet privado.

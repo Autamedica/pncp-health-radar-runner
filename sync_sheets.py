@@ -8,14 +8,18 @@ and syncs updates/new tenders directly into a private Google Sheet via Secrets.
 from __future__ import annotations
 
 import concurrent.futures
+import csv
 import datetime as dt
 import html
+import io
 import json
 import os
 import re
+import struct
 import subprocess
 import unicodedata
 import urllib.parse
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +104,47 @@ OP_HEADERS = [
     "Motivo / Brecha Clave",
     "Enlace PNCP",
 ]
+
+TCERS_HEADERS = [
+    "ID TCE-RS",
+    "Órgano (RS)",
+    "Modalidad",
+    "Proceso",
+    "Fase Actual",
+    "Abertura",
+    "Fim Credenciamento",
+    "Valor Estimado (R$)",
+    "Objeto",
+    "Estado / Dictamen",
+    "Link LicitaCon",
+]
+
+TCERS_TECH_KWS = (
+    "telessaud",
+    "telemedic",
+    "teleconsult",
+    "teleinterconsult",
+    "prontuario eletr",
+    "saude digital",
+    "teleatendimento",
+    "sistema de gestao de saude",
+    "sistema de gestao em saude",
+    "software de saude",
+    "software em saude",
+    "aplicativo de telemedicina",
+)
+
+TCERS_NOISE_KWS = (
+    "cadeiras ergonomicas",
+    "telemedicao",
+    "aquisicao de equipamentos",
+    "equipamentos medico-hospitalares",
+    "veterinar",
+    "ambulancia",
+    "medicamento",
+    "reagente",
+    "home care",
+)
 
 
 def fold(text: str) -> str:
@@ -239,6 +284,146 @@ def check_secondary() -> dict[str, Any]:
     return {"tce_rs_http": code_tce, "tce_rs_ok": tce_ok, "bo_ar_http": code_bo, "bo_ar_hits": bo_hits}
 
 
+def poll_tce_rs_2026(today_iso: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    url = "https://dados.tce.rs.gov.br/dados/licitacon/licitacao/ano/2026.csv.zip"
+    try:
+        hdr_proc = subprocess.run(
+            ["curl", "-sSI", "--max-time", "12", "-H", f"User-Agent: {UA}", url],
+            capture_output=True,
+            text=True,
+        )
+        if hdr_proc.returncode != 0:
+            return [], {"ok": False, "error": f"HEAD rc={hdr_proc.returncode}", "active_hits": 0}
+        total_len = 0
+        last_mod = ""
+        for line in hdr_proc.stdout.splitlines():
+            low = line.lower()
+            if low.startswith("content-length:"):
+                total_len = int(line.split(":", 1)[1].strip())
+            elif low.startswith("last-modified:"):
+                last_mod = line.split(":", 1)[1].strip()
+        if total_len < 16384:
+            return [], {"ok": False, "error": "Missing Content-Length", "active_hits": 0}
+
+        tail_start = max(0, total_len - 8192)
+        tail = subprocess.check_output(
+            ["curl", "-sS", "--max-time", "15", "-r", f"{tail_start}-{total_len - 1}", url]
+        )
+        eocd = tail.rfind(b"PK\x05\x06")
+        if eocd == -1:
+            return [], {"ok": False, "error": "ZIP EOCD not found", "active_hits": 0}
+        cd_size, cd_offset = struct.unpack("<II", tail[eocd + 12 : eocd + 20])
+        cd = subprocess.check_output(
+            ["curl", "-sS", "--max-time", "15", "-r", f"{cd_offset}-{cd_offset + cd_size - 1}", url]
+        )
+
+        pos = 0
+        target: tuple[int, int] | None = None
+        while pos < len(cd) and cd[pos : pos + 4] == b"PK\x01\x02":
+            comp_sz = struct.unpack("<I", cd[pos + 20 : pos + 24])[0]
+            fn_len, ex_len, cm_len = struct.unpack("<HHH", cd[pos + 28 : pos + 34])
+            local_off = struct.unpack("<I", cd[pos + 42 : pos + 46])[0]
+            fname = cd[pos + 46 : pos + 46 + fn_len].decode("utf-8", errors="replace")
+            if fname == "licitacao.csv":
+                target = (local_off, comp_sz)
+                break
+            pos += 46 + fn_len + ex_len + cm_len
+        if target is None:
+            return [], {"ok": False, "error": "licitacao.csv not found in ZIP", "active_hits": 0}
+
+        local_off, comp_sz = target
+        lfh = subprocess.check_output(
+            ["curl", "-sS", "--max-time", "12", "-r", f"{local_off}-{local_off + 29}", url]
+        )
+        l_fn, l_ex = struct.unpack("<HH", lfh[26:30])
+        data_start = local_off + 30 + l_fn + l_ex
+        data_end = data_start + comp_sz - 1
+
+        n_chunks = 6
+        chunk_sz = (comp_sz + n_chunks - 1) // n_chunks
+        ranges = [
+            (data_start + i * chunk_sz, min(data_end, data_start + (i + 1) * chunk_sz - 1))
+            for i in range(n_chunks)
+        ]
+
+        def _fetch_chunk(rng: tuple[int, int]) -> bytes:
+            return subprocess.check_output(
+                ["curl", "-sS", "--max-time", "45", "-r", f"{rng[0]}-{rng[1]}", url]
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+            comp_data = b"".join(ex.map(_fetch_chunk, ranges))
+
+        raw_csv = zlib.decompress(comp_data, -zlib.MAX_WBITS)
+        cutoff_30d = (dt.date.fromisoformat(today_iso) - dt.timedelta(days=30)).isoformat()
+
+        reader = csv.DictReader(io.TextIOWrapper(io.BytesIO(raw_csv), encoding="utf-8-sig", errors="replace"))
+        dedup: dict[str, dict[str, Any]] = {}
+        total_rows = 0
+        for row in reader:
+            total_rows += 1
+            obj_raw = (row.get("DS_OBJETO") or "").strip()
+            obj_f = fold(obj_raw)
+            if not any(k in obj_f for k in TCERS_TECH_KWS):
+                continue
+            if any(n in obj_f for n in TCERS_NOISE_KWS):
+                continue
+
+            dt_hom = (row.get("DT_HOMOLOGACAO") or "").strip()
+            if dt_hom:
+                continue
+
+            fase = (row.get("CD_TIPO_FASE_ATUAL") or "").strip().upper()
+            dt_ab = (row.get("DT_ABERTURA") or "").strip()
+            dt_fim_inscr = (row.get("DT_FIM_INSCR_CRED") or "").strip()
+            dt_fim_vig = (row.get("DT_FIM_VIGEN_CRED") or "").strip()
+
+            is_active = (
+                fase in ("EPU", "PUB", "HAP", "ABE")
+                or dt_fim_inscr >= today_iso
+                or dt_fim_vig >= today_iso
+                or dt_ab >= cutoff_30d
+            )
+            if not is_active:
+                continue
+
+            cd_orgao = (row.get("CD_ORGAO") or "").strip()
+            mod = (row.get("CD_TIPO_MODALIDADE") or "").strip()
+            nr = (row.get("NR_LICITACAO") or "").strip()
+            ano = (row.get("ANO_LICITACAO") or "").strip()
+            rid = f"TCERS-{cd_orgao}-{mod}-{nr}/{ano}"
+
+            vl_raw = (row.get("VL_LICITACAO") or "").strip()
+            try:
+                vl_num: Any = float(vl_raw) if vl_raw else ""
+            except ValueError:
+                vl_num = ""
+
+            fim_cred = dt_fim_inscr or dt_fim_vig
+            dedup[rid] = {
+                "id": rid,
+                "orgao": (row.get("NM_ORGAO") or "").strip(),
+                "mod": mod,
+                "proceso": f"{nr}/{ano}",
+                "fase": fase,
+                "abertura": dt_ab,
+                "fim_cred": fim_cred,
+                "valor": vl_num,
+                "objeto": re.sub(r"\s+", " ", obj_raw)[:280],
+                "link": (row.get("LINK_LICITACON_CIDADAO") or "").strip(),
+            }
+
+        items = sorted(dedup.values(), key=lambda x: (x["fim_cred"] or "", x["abertura"] or ""), reverse=True)
+        return items, {
+            "ok": True,
+            "last_modified": last_mod,
+            "total_rows_scanned": total_rows,
+            "active_hits": len(items),
+        }
+    except Exception as exc:
+        return [], {"ok": False, "error": f"{type(exc).__name__}: {exc}", "active_hits": 0}
+
+
 def fmt_dt(val: str | None) -> str:
     return val[:16].replace("T", " ") if val else ""
 
@@ -247,11 +432,82 @@ def build_pncp_url(item: dict[str, Any]) -> str:
     return f"https://pncp.gov.br/app/editais/{item.get('orgao_cnpj')}/{item.get('ano')}/{item.get('numero_sequencial')}"
 
 
+def sync_tce_rs_tab(
+    sh: Any,
+    tabs: dict[str, Any],
+    now_utc: str,
+    tce_items: list[dict[str, Any]],
+) -> tuple[int, int]:
+    if "TCE_RS_2026" not in tabs:
+        ws_tce = sh.add_worksheet(title="TCE_RS_2026", rows=300, cols=11)
+        ws_tce.update(
+            range_name="A1",
+            values=[
+                ["RIO GRANDE DO SUL — TCE-RS LICITACON 2026 (ACTUALIZACIÓN HTTP-RANGE)"],
+                [f"Actualizado automáticamente desde dados.tce.rs.gov.br: {now_utc}"],
+                [""],
+                TCERS_HEADERS,
+            ],
+            value_input_option="USER_ENTERED",
+        )
+        tabs["TCE_RS_2026"] = ws_tce
+    else:
+        ws_tce = tabs["TCE_RS_2026"]
+        ws_tce.update(range_name="A2", values=[[f"Actualizado automáticamente desde dados.tce.rs.gov.br: {now_utc}"]], value_input_option="USER_ENTERED")
+
+    existing_vals = ws_tce.get_all_values()
+    if len(existing_vals) < 4:
+        ws_tce.update(range_name="A4:K4", values=[TCERS_HEADERS], value_input_option="USER_ENTERED")
+        existing_vals = ws_tce.get_all_values()
+
+    existing_map: dict[str, int] = {}
+    for idx in range(4, len(existing_vals)):
+        rid = (existing_vals[idx][0] if existing_vals[idx] else "").strip()
+        if rid:
+            existing_map[rid] = idx + 1
+
+    updates: list[dict[str, Any]] = []
+    new_rows: list[list[Any]] = []
+    for it in tce_items:
+        rid = it["id"]
+        if rid in existing_map:
+            r_num = existing_map[rid]
+            updates.append({"range": f"E{r_num}", "values": [[it["fase"]]]})
+            updates.append({"range": f"G{r_num}:H{r_num}", "values": [[it["fim_cred"], it["valor"]]]})
+        else:
+            link = it["link"]
+            link_cell = f'=HYPERLINK("{link}","LicitaCon")' if link.startswith("http") else ""
+            new_rows.append(
+                [
+                    rid,
+                    it["orgao"],
+                    it["mod"],
+                    it["proceso"],
+                    it["fase"],
+                    it["abertura"],
+                    it["fim_cred"],
+                    it["valor"],
+                    it["objeto"],
+                    "NUEVO — Revisar (TCE-RS)",
+                    link_cell,
+                ]
+            )
+
+    if updates:
+        ws_tce.batch_update(updates, value_input_option="USER_ENTERED")
+    if new_rows:
+        ws_tce.append_rows(new_rows, value_input_option="USER_ENTERED")
+
+    return len(tce_items), len(new_rows)
+
+
 def sync_google_sheet(
     now_utc: str,
     candidates: dict[str, dict[str, Any]],
     pncp_stats: dict[str, Any],
     sec_stats: dict[str, Any],
+    tce_items: list[dict[str, Any]],
+    tce_stats: dict[str, Any],
 ) -> tuple[bool, dict[str, Any]]:
     sa_raw = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
     sheet_id = (os.environ.get("GOOGLE_SHEET_ID") or "").strip()
@@ -264,6 +520,8 @@ def sync_google_sheet(
             "refreshed": 0,
             "new_items": [],
             "status_changes": [],
+            "tce_rs_active": tce_stats.get("active_hits", 0),
+            "tce_rs_new": 0,
         }
 
     import gspread
@@ -419,16 +677,29 @@ def sync_google_sheet(
             value_input_option="USER_ENTERED",
         )
 
+    # Sync TCE-RS 2026 tab (non-destructive merge)
+    tce_active_cnt, tce_new_cnt = sync_tce_rs_tab(sh, tabs, now_utc, tce_items) if tce_items else (0, 0)
+
     # Append 1 audit row to Log_Sincronizacion
+    log_headers = [
+        "timestamp_utc",
+        "pncp_ok",
+        "total_rows",
+        "refreshed",
+        "new_items",
+        "status_changes",
+        "tce_rs_http",
+        "bo_ar_http",
+        "bo_ar_hits",
+        "tce_rs_active",
+        "tce_rs_new",
+    ]
     if "Log_Sincronizacion" not in tabs:
-        ws_log = sh.add_worksheet(title="Log_Sincronizacion", rows=500, cols=9)
-        ws_log.update(
-            range_name="A1:I1",
-            values=[["timestamp_utc", "pncp_ok", "total_rows", "refreshed", "new_items", "status_changes", "tce_rs_http", "bo_ar_http", "bo_ar_hits"]],
-            value_input_option="USER_ENTERED",
-        )
+        ws_log = sh.add_worksheet(title="Log_Sincronizacion", rows=500, cols=11)
+        ws_log.update(range_name="A1:K1", values=[log_headers], value_input_option="USER_ENTERED")
     else:
         ws_log = tabs["Log_Sincronizacion"]
+        ws_log.update(range_name="A1:K1", values=[log_headers], value_input_option="USER_ENTERED")
 
     ws_log.append_row(
         [
@@ -441,6 +712,8 @@ def sync_google_sheet(
             sec_stats["tce_rs_http"],
             sec_stats["bo_ar_http"],
             json.dumps(sec_stats["bo_ar_hits"], ensure_ascii=False),
+            tce_active_cnt,
+            tce_new_cnt,
         ],
         value_input_option="USER_ENTERED",
     )
@@ -451,6 +724,8 @@ def sync_google_sheet(
         "refreshed": refreshed,
         "new_items": new_items,
         "status_changes": status_changes,
+        "tce_rs_active": tce_active_cnt,
+        "tce_rs_new": tce_new_cnt,
     }
 
 
@@ -469,21 +744,31 @@ def send_telegram(text: str) -> None:
 
 
 def main() -> None:
-    now_utc = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now_dt = dt.datetime.now(dt.timezone.utc)
+    now_utc = now_dt.strftime("%Y-%m-%d %H:%M UTC")
+    today_iso = now_dt.date().isoformat()
     candidates, pncp_stats = poll_pncp()
     sec_stats = check_secondary()
-    synced, res = sync_google_sheet(now_utc, candidates, pncp_stats, sec_stats)
+    tce_items, tce_stats = poll_tce_rs_2026(today_iso)
+    synced, res = sync_google_sheet(now_utc, candidates, pncp_stats, sec_stats, tce_items, tce_stats)
 
+    tce_desc = (
+        f"OK ({tce_stats['active_hits']} active RS matches of {tce_stats['total_rows_scanned']} rows)"
+        if tce_stats.get("ok")
+        else f"WARN ({tce_stats.get('error', 'unavailable')})"
+    )
     lines = [
-        f"## PNCP & AR Health Radar Sync ({now_utc})",
+        f"## PNCP, TCE-RS & AR Health Radar Sync ({now_utc})",
         f"- **PNCP Search:** {pncp_stats['ok_calls']}/{pncp_stats['total_calls']} OK ({pncp_stats['unique_relevant']} relevant active tenders)",
+        f"- **TCE-RS 2026 HTTP-Range:** {tce_desc}",
         f"- **TCE-RS CKAN:** HTTP {sec_stats['tce_rs_http']} | **Boletin Oficial AR:** HTTP {sec_stats['bo_ar_http']} (hits={len(sec_stats['bo_ar_hits'])})",
         f"- **Google Sheets:** {res['message']}",
     ]
     if synced:
         lines.append(
-            f"- **Sheet stats:** total_rows={res['total_rows']}, refreshed={res['refreshed']}, "
-            f"new={len(res['new_items'])}, status_changes={len(res['status_changes'])}"
+            f"- **Sheet stats:** pncp_rows={res['total_rows']}, refreshed={res['refreshed']}, "
+            f"pncp_new={len(res['new_items'])}, status_changes={len(res['status_changes'])}, "
+            f"tce_rs_active={res['tce_rs_active']}, tce_rs_new={res['tce_rs_new']}"
         )
 
     summary_md = "\n".join(lines)
@@ -494,9 +779,12 @@ def main() -> None:
         with open(step_sum, "a", encoding="utf-8") as f:
             f.write(summary_md + "\n")
 
-    if synced and (res["new_items"] or res["status_changes"]):
-        msg = f"PNCP B2G Radar ({now_utc})\nNuevas: {len(res['new_items'])} | Cambios: {len(res['status_changes'])}\n"
-        for it in res["new_items"][:5]:
+    if synced and (res["new_items"] or res["status_changes"] or res.get("tce_rs_new", 0) > 0):
+        msg = (
+            f"B2G Health Radar ({now_utc})\n"
+            f"PNCP nuevas: {len(res['new_items'])} | Cambios: {len(res['status_changes'])} | TCE-RS nuevas: {res.get('tce_rs_new', 0)}\n"
+        )
+        for it in res["new_items"][:4]:
             msg += f"- [{it['uf']}] {it['orgao']} | {it['title']} ({it['enc']}) {it['url']}\n"
         send_telegram(msg)
 
