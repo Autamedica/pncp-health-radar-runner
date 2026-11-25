@@ -23,6 +23,8 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+import compliance_engine
+
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
 
 NATIONAL_QUERIES = (
@@ -348,7 +350,21 @@ def poll_tce_rs_2026(today_iso: str) -> tuple[list[dict[str, Any]], dict[str, An
 
         def _fetch_chunk(rng: tuple[int, int]) -> bytes:
             return subprocess.check_output(
-                ["curl", "-sS", "--retry", "2", "--retry-delay", "2", "--max-time", "90", "-r", f"{rng[0]}-{rng[1]}", url]
+                [
+                    "curl",
+                    "-sS",
+                    "--http1.1",
+                    "--retry",
+                    "3",
+                    "--retry-delay",
+                    "2",
+                    "--retry-all-errors",
+                    "--max-time",
+                    "90",
+                    "-r",
+                    f"{rng[0]}-{rng[1]}",
+                    url,
+                ]
             )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
@@ -680,6 +696,15 @@ def sync_google_sheet(
     # Sync TCE-RS 2026 tab (non-destructive merge)
     tce_active_cnt, tce_new_cnt = sync_tce_rs_tab(sh, tabs, now_utc, tce_items) if tce_items else (0, 0)
 
+    # Build/refresh automated compliance & gap matrix ("Lo que exigen vs. Lo que tengo")
+    op_formulas = ws_op.get_all_values(value_render_option="FORMULA")[4:]
+    tce_formulas = (
+        tabs["TCE_RS_2026"].get_all_values(value_render_option="FORMULA")[4:]
+        if "TCE_RS_2026" in tabs
+        else []
+    )
+    comp_stats = compliance_engine.sync_compliance_matrix(sh, tabs, now_utc, op_formulas, tce_formulas)
+
     # Append 1 audit row to Log_Sincronizacion
     log_headers = [
         "timestamp_utc",
@@ -726,6 +751,7 @@ def sync_google_sheet(
         "status_changes": status_changes,
         "tce_rs_active": tce_active_cnt,
         "tce_rs_new": tce_new_cnt,
+        "compliance": comp_stats,
     }
 
 
@@ -765,11 +791,19 @@ def main() -> None:
         f"- **Google Sheets:** {res['message']}",
     ]
     if synced:
+        comp = res.get("compliance") or {}
         lines.append(
             f"- **Sheet stats:** pncp_rows={res['total_rows']}, refreshed={res['refreshed']}, "
             f"pncp_new={len(res['new_items'])}, status_changes={len(res['status_changes'])}, "
             f"tce_rs_active={res['tce_rs_active']}, tce_rs_new={res['tce_rs_new']}"
         )
+        if comp:
+            lines.append(
+                f"- **Compliance matrix:** tenders_scored={comp.get('tenders_scored', 0)}, "
+                f"detail_rows={comp.get('detail_rows', 0)}, "
+                f"pdfs_audited_now={comp.get('pdfs_audited_now', 0)}, "
+                f"pdfs_cached={comp.get('pdfs_cached', 0)}"
+            )
 
     summary_md = "\n".join(lines)
     print(summary_md, flush=True)
