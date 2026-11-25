@@ -697,13 +697,14 @@ def sync_google_sheet(
     tce_active_cnt, tce_new_cnt = sync_tce_rs_tab(sh, tabs, now_utc, tce_items) if tce_items else (0, 0)
 
     # Build/refresh automated compliance & gap matrix ("Lo que exigen vs. Lo que tengo")
-    op_formulas = ws_op.get_all_values(value_render_option="FORMULA")[4:]
-    tce_formulas = (
-        tabs["TCE_RS_2026"].get_all_values(value_render_option="FORMULA")[4:]
-        if "TCE_RS_2026" in tabs
-        else []
-    )
-    comp_stats = compliance_engine.sync_compliance_matrix(sh, tabs, now_utc, op_formulas, tce_formulas)
+    op_fmt = ws_op.get_all_values()[4:]
+    op_fml = ws_op.get_all_values(value_render_option="FORMULA")[4:]
+    if "TCE_RS_2026" in tabs:
+        tce_fmt = tabs["TCE_RS_2026"].get_all_values()[4:]
+        tce_fml = tabs["TCE_RS_2026"].get_all_values(value_render_option="FORMULA")[4:]
+    else:
+        tce_fmt, tce_fml = [], []
+    comp_stats = compliance_engine.sync_compliance_matrix(sh, tabs, now_utc, op_fmt, tce_fmt, op_fml, tce_fml)
 
     # Append 1 audit row to Log_Sincronizacion
     log_headers = [

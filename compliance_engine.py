@@ -198,6 +198,31 @@ def fold(text: str) -> str:
     return "".join(ch for ch in s if not unicodedata.combining(ch)).lower()
 
 
+def _cell_str(row: list[Any], idx: int) -> str:
+    if len(row) <= idx or row[idx] is None:
+        return ""
+    return str(row[idx]).strip()
+
+
+def _parse_money(val: Any) -> Any:
+    if val is None or val == "":
+        return ""
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if not s:
+        return ""
+    s_clean = re.sub(r"[^\d.,-]", "", s)
+    if "," in s_clean and "." in s_clean:
+        s_clean = s_clean.replace(".", "").replace(",", ".") if s_clean.rfind(",") > s_clean.rfind(".") else s_clean.replace(",", "")
+    elif "," in s_clean:
+        s_clean = s_clean.replace(",", ".")
+    try:
+        return float(s_clean)
+    except ValueError:
+        return ""
+
+
 def _sanitize_cell_text(val: str) -> str:
     s = re.sub(r"\s+", " ", (val or "").strip())
     if s.startswith(("=", "+", "-", "@")):
@@ -562,8 +587,10 @@ def sync_compliance_matrix(
     sh: Any,
     tabs: dict[str, Any],
     now_utc: str,
-    op_rows_formulas: list[list[str]],
-    tce_rows_formulas: list[list[str]],
+    op_rows_fmt: list[list[Any]],
+    tce_rows_fmt: list[list[Any]],
+    op_rows_fml: list[list[Any]] | None = None,
+    tce_rows_fml: list[list[Any]] | None = None,
     max_pdf_per_run: int = 18,
 ) -> dict[str, int]:
     """Build/refresh Matriz_Requisitos_Detalle and Matriz_Gap_Licitaciones from live data."""
@@ -571,22 +598,19 @@ def sync_compliance_matrix(
     pdf_cache, link_cache = _read_pdf_cache(tabs)
 
     tenders: list[dict[str, Any]] = []
-    for row in op_rows_formulas:
-        pid = (row[6] if len(row) > 6 else "").strip()
+    for i, row in enumerate(op_rows_fmt):
+        fml = op_rows_fml[i] if (op_rows_fml and i < len(op_rows_fml)) else row
+        pid = _cell_str(row, 6)
         if not pid:
             continue
-        prio = (row[0] if len(row) > 0 else "P2").strip()
-        uf = (row[2] if len(row) > 2 else "").strip()
-        orgao = (row[4] if len(row) > 4 else "").strip()
-        proceso = (row[5] if len(row) > 5 else "").strip()
-        val_raw = (row[8] if len(row) > 8 else "").strip()
-        try:
-            val_num: Any = float(str(val_raw).replace(",", ".")) if val_raw else ""
-        except ValueError:
-            val_num = ""
-        cierre = (row[9] if len(row) > 9 else "").strip()
-        motivo = (row[12] if len(row) > 12 else "").strip()
-        raw_link = extract_url_from_cell(row[13] if len(row) > 13 else "") or pncp_url_from_id(pid)
+        prio = _cell_str(row, 0) or "P2"
+        uf = _cell_str(row, 2)
+        orgao = _cell_str(row, 4)
+        proceso = _cell_str(row, 5)
+        val_num = _parse_money(fml[8] if len(fml) > 8 else (row[8] if len(row) > 8 else ""))
+        cierre = _cell_str(row, 9)
+        motivo = _cell_str(row, 12)
+        raw_link = extract_url_from_cell(_cell_str(fml, 13)) or pncp_url_from_id(pid)
         tenders.append(
             {
                 "pid": pid,
@@ -602,20 +626,17 @@ def sync_compliance_matrix(
             }
         )
 
-    for row in tce_rows_formulas:
-        rid = (row[0] if len(row) > 0 else "").strip()
+    for i, row in enumerate(tce_rows_fmt):
+        fml = tce_rows_fml[i] if (tce_rows_fml and i < len(tce_rows_fml)) else row
+        rid = _cell_str(row, 0)
         if not rid:
             continue
-        orgao = (row[1] if len(row) > 1 else "").strip()
-        proceso = f"{(row[2] if len(row) > 2 else '').strip()} {(row[3] if len(row) > 3 else '').strip()}".strip()
-        fim_cred = (row[6] if len(row) > 6 else "").strip() or (row[5] if len(row) > 5 else "").strip()
-        val_raw = (row[7] if len(row) > 7 else "").strip()
-        try:
-            val_num = float(str(val_raw).replace(",", ".")) if val_raw else ""
-        except ValueError:
-            val_num = ""
-        objeto = (row[8] if len(row) > 8 else "").strip()
-        raw_link = extract_url_from_cell(row[10] if len(row) > 10 else "")
+        orgao = _cell_str(row, 1)
+        proceso = f"{_cell_str(row, 2)} {_cell_str(row, 3)}".strip()
+        fim_cred = _cell_str(row, 6) or _cell_str(row, 5)
+        val_num = _parse_money(fml[7] if len(fml) > 7 else (row[7] if len(row) > 7 else ""))
+        objeto = _cell_str(row, 8)
+        raw_link = extract_url_from_cell(_cell_str(fml, 10))
         tenders.append(
             {
                 "pid": rid,
