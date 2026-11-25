@@ -339,7 +339,7 @@ def poll_tce_rs_2026(today_iso: str) -> tuple[list[dict[str, Any]], dict[str, An
         data_start = local_off + 30 + l_fn + l_ex
         data_end = data_start + comp_sz - 1
 
-        n_chunks = 6
+        n_chunks = 12
         chunk_sz = (comp_sz + n_chunks - 1) // n_chunks
         ranges = [
             (data_start + i * chunk_sz, min(data_end, data_start + (i + 1) * chunk_sz - 1))
@@ -348,10 +348,10 @@ def poll_tce_rs_2026(today_iso: str) -> tuple[list[dict[str, Any]], dict[str, An
 
         def _fetch_chunk(rng: tuple[int, int]) -> bytes:
             return subprocess.check_output(
-                ["curl", "-sS", "--max-time", "45", "-r", f"{rng[0]}-{rng[1]}", url]
+                ["curl", "-sS", "--retry", "2", "--retry-delay", "2", "--max-time", "90", "-r", f"{rng[0]}-{rng[1]}", url]
             )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
             comp_data = b"".join(ex.map(_fetch_chunk, ranges))
 
         raw_csv = zlib.decompress(comp_data, -zlib.MAX_WBITS)
