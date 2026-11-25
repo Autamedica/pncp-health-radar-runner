@@ -453,9 +453,17 @@ def sync_tce_rs_tab(
     tabs: dict[str, Any],
     now_utc: str,
     tce_items: list[dict[str, Any]],
+    reset_tab: bool = False,
 ) -> tuple[int, int]:
     if "TCE_RS_2026" not in tabs:
         ws_tce = sh.add_worksheet(title="TCE_RS_2026", rows=300, cols=11)
+        reset_tab = True
+        tabs["TCE_RS_2026"] = ws_tce
+    else:
+        ws_tce = tabs["TCE_RS_2026"]
+
+    if reset_tab:
+        ws_tce.clear()
         ws_tce.update(
             range_name="A1",
             values=[
@@ -466,9 +474,7 @@ def sync_tce_rs_tab(
             ],
             value_input_option="USER_ENTERED",
         )
-        tabs["TCE_RS_2026"] = ws_tce
     else:
-        ws_tce = tabs["TCE_RS_2026"]
         ws_tce.update(range_name="A2", values=[[f"Actualizado automáticamente desde dados.tce.rs.gov.br: {now_utc}"]], value_input_option="USER_ENTERED")
 
     existing_vals = ws_tce.get_all_values()
@@ -498,7 +504,7 @@ def sync_tce_rs_tab(
                     rid,
                     it["orgao"],
                     it["mod"],
-                    it["proceso"],
+                    f"'{it['proceso']}",
                     it["fase"],
                     it["abertura"],
                     it["fim_cred"],
@@ -547,28 +553,45 @@ def sync_google_sheet(
     creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(sheet_id)
+    locale_migrated = False
+    try:
+        meta = sh.fetch_sheet_metadata({"fields": "properties.locale"})
+        if meta.get("properties", {}).get("locale") != "en_US":
+            sh.batch_update(
+                {"requests": [{"updateSpreadsheetProperties": {"properties": {"locale": "en_US"}, "fields": "locale"}}]}
+            )
+            locale_migrated = True
+    except Exception:
+        pass
+
     tabs = {ws.title: ws for ws in sh.worksheets()}
 
+    op_header_rows = [
+        ["BRASIL — OPORTUNIDADES PNCP (SINCRONIZACIÓN AUTOMÁTICA)"],
+        [f"Actualizado automáticamente desde PNCP API: {now_utc}"],
+        [""],
+        OP_HEADERS,
+    ]
     if "Oportunidades_PNCP_BR" not in tabs:
         ws_op = sh.add_worksheet(title="Oportunidades_PNCP_BR", rows=300, cols=14)
-        ws_op.update(
-            range_name="A1",
-            values=[
-                ["BRASIL — OPORTUNIDADES PNCP (SINCRONIZACIÓN AUTOMÁTICA)"],
-                [f"Actualizado automáticamente desde PNCP API: {now_utc}"],
-                [""],
-                OP_HEADERS,
-            ],
-            value_input_option="USER_ENTERED",
-        )
+        ws_op.update(range_name="A1", values=op_header_rows, value_input_option="USER_ENTERED")
         tabs["Oportunidades_PNCP_BR"] = ws_op
     else:
         ws_op = tabs["Oportunidades_PNCP_BR"]
 
     existing_vals = ws_op.get_all_values()
-    if len(existing_vals) < 4:
-        ws_op.update(range_name="A4:N4", values=[OP_HEADERS], value_input_option="USER_ENTERED")
+    if locale_migrated or len(existing_vals) < 4 or existing_vals[3][:14] != OP_HEADERS:
+        if ws_op.col_count < 14:
+            ws_op.resize(rows=max(ws_op.row_count, 300), cols=14)
+        ws_op.clear()
+        ws_op.update(range_name="A1", values=op_header_rows, value_input_option="USER_ENTERED")
         existing_vals = ws_op.get_all_values()
+    else:
+        ws_op.update(
+            range_name="A2",
+            values=[[f"Actualizado automáticamente desde PNCP API: {now_utc}"]],
+            value_input_option="USER_ENTERED",
+        )
 
     existing_ids: dict[str, tuple[int, list[str]]] = {}
     for idx in range(4, len(existing_vals)):
@@ -693,8 +716,10 @@ def sync_google_sheet(
             value_input_option="USER_ENTERED",
         )
 
-    # Sync TCE-RS 2026 tab (non-destructive merge)
-    tce_active_cnt, tce_new_cnt = sync_tce_rs_tab(sh, tabs, now_utc, tce_items) if tce_items else (0, 0)
+    # Sync TCE-RS 2026 tab (non-destructive merge unless locale just migrated)
+    tce_active_cnt, tce_new_cnt = (
+        sync_tce_rs_tab(sh, tabs, now_utc, tce_items, reset_tab=locale_migrated) if tce_items else (0, 0)
+    )
 
     # Build/refresh automated compliance & gap matrix ("Lo que exigen vs. Lo que tengo")
     op_fmt = ws_op.get_all_values()[4:]

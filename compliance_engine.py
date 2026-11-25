@@ -598,11 +598,13 @@ def sync_compliance_matrix(
     pdf_cache, link_cache = _read_pdf_cache(tabs)
 
     tenders: list[dict[str, Any]] = []
+    seen_pids: set[str] = set()
     for i, row in enumerate(op_rows_fmt):
         fml = op_rows_fml[i] if (op_rows_fml and i < len(op_rows_fml)) else row
         pid = _cell_str(row, 6)
-        if not pid:
+        if not parse_pncp_id(pid) or pid in seen_pids:
             continue
+        seen_pids.add(pid)
         prio = _cell_str(row, 0) or "P2"
         uf = _cell_str(row, 2)
         orgao = _cell_str(row, 4)
@@ -629,8 +631,9 @@ def sync_compliance_matrix(
     for i, row in enumerate(tce_rows_fmt):
         fml = tce_rows_fml[i] if (tce_rows_fml and i < len(tce_rows_fml)) else row
         rid = _cell_str(row, 0)
-        if not rid:
+        if not rid.startswith("TCERS-") or rid in seen_pids:
             continue
+        seen_pids.add(rid)
         orgao = _cell_str(row, 1)
         proceso = f"{_cell_str(row, 2)} {_cell_str(row, 3)}".strip()
         fim_cred = _cell_str(row, 6) or _cell_str(row, 5)
